@@ -9,3 +9,6 @@ edition = "2018"
 [dependencies]
 anyhow = "1.0.40"
 clap = "2.33.3"
+itertools = "0.10.0"
+rand = "0.8.3"
+tokio = { version = "1.6.0", features = ["full"] }
