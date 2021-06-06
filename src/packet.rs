@@ -54,7 +54,8 @@ impl Packet {
     }
 
     pub fn check_sum(&self) -> bool {
-        todo!()
+        // TODO: use checksum
+        true
     }
 
     pub fn seq(&self) -> Ack {
@@ -166,11 +167,13 @@ impl From<PseudoPacket> for Packet {
 
 impl PseudoPacket {
     pub fn data_offset(&self) -> u8 {
-        todo!()
+        // TODO: use data offset (options support)
+        0
     }
 
     pub fn checksum(&self) -> u16 {
-        todo!()
+        // TODO: use checksum
+        0
     }
 }
 
