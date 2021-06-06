@@ -19,6 +19,7 @@ use crate::{
 #[tokio::main]
 pub async fn start_server(address: impl ToSocketAddrs) -> Result<()> {
     let socket = Arc::new(PacketSocket(UdpSocket::bind(address).await?));
+    println!("Started on {:?}", socket.0.local_addr()?);
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(event_listener(tx.clone(), rx, socket.clone()));
     loop {
@@ -120,7 +121,7 @@ impl Connection {
         let (seq, mut ack) = self.start_connection().await?;
         while let Some((new_ack, data)) = self.receive_chunk(seq, ack).await? {
             ack = new_ack;
-            self.report(format!("{:?}", data));
+            self.report(format!("{:?}", String::from_utf8(data)));
         }
         self.report("received fin");
         self.terminate_connection(seq, ack).await
