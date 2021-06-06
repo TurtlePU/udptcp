@@ -62,7 +62,12 @@ async fn event_listener(
                 .or_insert_with_key(|&address| on_new_connection(address))
                 .send(packet)?,
             Event::Close(address) => {
-                connections.remove(&address).unwrap().join().await?
+                match connections.remove(&address).unwrap().join().await {
+                    Ok(()) => println!("Connection on {:?} closed", address),
+                    Err(err) => {
+                        println!("Connection on {:?} errored: {}", address, err)
+                    }
+                }
             }
         }
     }
@@ -103,11 +108,15 @@ impl Connection {
         })
     }
 
-    fn handles(self, sender: UnboundedSender<Packet>) -> ConnectionHandles {
-        ConnectionHandles(tokio::spawn(self.task()), sender)
+    fn handles(mut self, sender: UnboundedSender<Packet>) -> ConnectionHandles {
+        ConnectionHandles(tokio::spawn(async move {
+            let result = self.task().await;
+            self.close().unwrap();
+            result
+        }), sender)
     }
 
-    async fn task(mut self) -> Result<()> {
+    async fn task(&mut self) -> Result<()> {
         let (seq, mut ack) = self.start_connection().await?;
         while let Some((new_ack, data)) = self.receive_chunk(seq, ack).await? {
             ack = new_ack;
@@ -158,18 +167,21 @@ impl Connection {
         }
     }
 
-    async fn terminate_connection(mut self, seq: Seq, ack: Ack) -> Result<()> {
+    async fn terminate_connection(&mut self, seq: Seq, ack: Ack) -> Result<()> {
         loop {
             self.socket.send(self.header.fin_ack(seq, ack + 1)).await?;
             if let Some(packet) = self.source.receive().await {
                 if let Some(new_ack) = packet.ack(seq + 1) {
                     if new_ack.0 == ack.0 + 1 {
-                        self.emitter.send(Event::Close(self.header.dest))?;
                         break Ok(());
                     }
                 }
             }
         }
+    }
+
+    fn close(&self) -> Result<()> {
+        Ok(self.emitter.send(Event::Close(self.header.dest))?)
     }
 
     fn report(&self, message: impl Into<Cow<'static, str>>) {
