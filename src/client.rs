@@ -72,7 +72,7 @@ impl Client {
         let ack = loop {
             self.socket.send(self.header.fin(seq))?;
             if let Some(packet) = self.socket.recv()? {
-                if let Some(ack) = packet.fin_ack(seq) {
+                if let Some(ack) = packet.fin_ack(seq + 1) {
                     break ack;
                 }
             }
