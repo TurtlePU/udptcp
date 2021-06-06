@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use anyhow::Result;
 
@@ -10,6 +10,13 @@ pub const CHUNK_SIZE: usize = 1024;
 pub struct PacketSocket<T>(pub T);
 
 impl PacketSocket<std::net::UdpSocket> {
+    pub fn new(socket: std::net::UdpSocket) -> Self {
+        socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        Self(socket)
+    }
+
     pub fn send(&self, packet: Packet) -> Result<()> {
         println!("sending packet {:?}", packet);
         let packet = packet.into_bytes();
@@ -22,7 +29,13 @@ impl PacketSocket<std::net::UdpSocket> {
         println!("receiving packet");
         let mut buffer = Vec::new();
         buffer.resize(MAX_PACKET_SIZE, 0);
-        let packet_size = self.0.recv(&mut buffer)?;
+        let packet_size = match self.0.recv(&mut buffer) {
+            Ok(packet_size) => packet_size,
+            Err(err) => match err.kind() {
+                std::io::ErrorKind::TimedOut => return Ok(None),
+                _ => return Err(err.into()),
+            },
+        };
         buffer.truncate(packet_size);
         println!("received buffer of length {}", packet_size);
         let packet = Packet::from_bytes(buffer)?;

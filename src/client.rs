@@ -37,7 +37,7 @@ impl Client {
     fn from_udp(socket: UdpSocket) -> Result<Self> {
         Ok(Self {
             header: Header::from_udp(&socket)?,
-            socket: PacketSocket(socket),
+            socket: PacketSocket::new(socket),
         })
     }
 
