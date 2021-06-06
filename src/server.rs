@@ -1,81 +1,253 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    borrow::Cow, collections::HashMap, convert::TryFrom, net::SocketAddr,
+    sync::Arc,
+};
 
-use anyhow::Result;
-use rand::Rng;
+use anyhow::{anyhow, Result};
+use rand::{thread_rng, Rng};
 use tokio::{
     net::{ToSocketAddrs, UdpSocket},
-    sync::{Mutex, RwLock},
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    task::JoinHandle,
+};
+
+use crate::{
+    packet::{Ack, Flags, Packet, PacketExtra, PseudoPacket, Seq},
+    socket::PacketSocket,
 };
 
 #[tokio::main]
 pub async fn start_server(address: impl ToSocketAddrs) -> Result<()> {
-    let socket = Arc::new(UdpSocket::bind(address).await?);
-    let conns = Arc::new(RwLock::new(Connections::default()));
+    let socket = Arc::new(PacketSocket(UdpSocket::bind(address).await?));
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(event_listener(tx.clone(), rx, socket.clone()));
     loop {
-        let (packet, addr) = next_packet(&socket).await?;
-        let socket = Arc::clone(&socket);
-        let conns = Arc::clone(&conns);
-        tokio::spawn(async move {
-            let conn = {
-                let conns = conns.read().await;
-                conns.find_addressant(addr)
-            };
-            let conn = match conn {
-                Some(conn) => conn,
-                None => {
-                    let mut conns = conns.write().await;
-                    let ack = rand::thread_rng().gen_range(0..1000);
-                    conns.create_connection(addr, ack)
-                }
-            };
-            let mut conn = conn.lock().await;
-            let verdict = conn.respond_to(&socket, packet).await.unwrap();
-            if let Verdict::_Close = verdict {
-                conns.write().await.remove_connection(addr);
-            }
-        });
+        tx.send(Event::from(socket.recv_from().await?))?;
     }
 }
 
-struct Packet;
+#[derive(Debug)]
+enum Event {
+    Receive(SocketAddr, Packet),
+    Close(SocketAddr),
+}
 
-async fn next_packet(_socket: &UdpSocket) -> Result<(Packet, SocketAddr)> {
-    todo!()
+type Letter = (Packet, SocketAddr);
+
+impl From<Letter> for Event {
+    fn from((packet, address): Letter) -> Self {
+        Self::Receive(address, packet)
+    }
+}
+
+type Connections = HashMap<SocketAddr, ConnectionHandles>;
+type Socket = Arc<PacketSocket<UdpSocket>>;
+
+async fn event_listener(
+    tx: UnboundedSender<Event>,
+    mut rx: UnboundedReceiver<Event>,
+    socket: Socket,
+) -> Result<()> {
+    let mut connections = Connections::default();
+    let on_new_connection = |address| {
+        let (ttx, rx) = mpsc::unbounded_channel();
+        Connection::new(tx.clone(), rx, socket.clone(), address)
+            .unwrap()
+            .handles(ttx)
+    };
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::Receive(address, packet) => connections
+                .entry(address)
+                .or_insert_with_key(|&address| on_new_connection(address))
+                .send(packet)?,
+            Event::Close(address) => {
+                connections.remove(&address).unwrap().join().await?
+            }
+        }
+    }
+    Ok(())
+}
+
+struct ConnectionHandles(JoinHandle<Result<()>>, UnboundedSender<Packet>);
+
+impl ConnectionHandles {
+    fn send(&mut self, packet: Packet) -> Result<()> {
+        Ok(self.1.send(packet)?)
+    }
+
+    async fn join(self) -> Result<()> {
+        Ok(self.0.await??)
+    }
 }
 
 struct Connection {
-    _ack: u32,
-    // ...
-}
-
-enum Verdict {
-    _Keep,
-    _Close,
+    emitter: UnboundedSender<Event>,
+    source: Source,
+    socket: ConnSocket,
+    header: Header,
 }
 
 impl Connection {
-    async fn respond_to(&mut self, _socket: &UdpSocket, _packet: Packet) -> Result<Verdict> {
-        todo!()
+    fn new(
+        emitter: UnboundedSender<Event>,
+        source: UnboundedReceiver<Packet>,
+        socket: Socket,
+        address: SocketAddr,
+    ) -> Result<Self> {
+        Ok(Self {
+            emitter,
+            source: Source(source),
+            header: Header::from_udp(&socket, address)?,
+            socket: ConnSocket(socket, address),
+        })
+    }
+
+    fn handles(self, sender: UnboundedSender<Packet>) -> ConnectionHandles {
+        ConnectionHandles(tokio::spawn(self.task()), sender)
+    }
+
+    async fn task(mut self) -> Result<()> {
+        let (seq, mut ack) = self.start_connection().await?;
+        while let Some((new_ack, data)) = self.receive_chunk(seq, ack).await? {
+            ack = new_ack;
+            self.report(format!("{:?}", data));
+        }
+        self.report("received fin");
+        self.terminate_connection(seq, ack).await
+    }
+
+    async fn start_connection(&mut self) -> Result<(Seq, Ack)> {
+        let packet = self.source.receive().await;
+        let packet = packet.ok_or(anyhow!("Broken packet"))?;
+        let ack = packet.syn().ok_or(anyhow!("Incorrect packet"))?;
+        let seq = Seq(thread_rng().gen_range(0..1000));
+        let new_ack = ack + 1;
+        loop {
+            self.socket.send(self.header.syn_ack(seq, new_ack)).await?;
+            let new_seq = seq + 1;
+            if let Some(packet) = self.source.receive().await {
+                if let Some(new_ack_too) = packet.ack(new_seq) {
+                    if new_ack.0 == new_ack_too.0 {
+                        break Ok((new_seq, new_ack));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn receive_chunk(
+        &mut self,
+        seq: Seq,
+        ack: Ack,
+    ) -> Result<Option<(Ack, Vec<u8>)>> {
+        loop {
+            self.socket.send(self.header.ack(seq, ack)).await?;
+            if let Some(packet) = self.source.receive().await {
+                let seq = packet.seq();
+                if seq.0 == ack.0 {
+                    break Ok(if packet.fin() {
+                        None
+                    } else {
+                        let data = packet.data();
+                        let new_ack = ack + u32::try_from(data.len())?;
+                        Some((new_ack, Vec::from(data)))
+                    });
+                }
+            }
+        }
+    }
+
+    async fn terminate_connection(mut self, seq: Seq, ack: Ack) -> Result<()> {
+        loop {
+            self.socket.send(self.header.fin_ack(seq, ack + 1)).await?;
+            if let Some(packet) = self.source.receive().await {
+                if let Some(new_ack) = packet.ack(seq + 1) {
+                    if new_ack.0 == ack.0 + 1 {
+                        self.emitter.send(Event::Close(self.header.dest))?;
+                        break Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    fn report(&self, message: impl Into<Cow<'static, str>>) {
+        let message: Cow<str> = message.into();
+        println!("[{:?}]: {}", self.header.dest, &*message);
     }
 }
 
-type SyncConnection = Arc<Mutex<Connection>>;
+struct Source(UnboundedReceiver<Packet>);
 
-#[derive(Default)]
-struct Connections(HashMap<SocketAddr, SyncConnection>);
+impl Source {
+    async fn receive(&mut self) -> Option<Packet> {
+        let packet = self.0.recv().await.unwrap();
+        if packet.check_sum() {
+            Some(packet)
+        } else {
+            None
+        }
+    }
+}
 
-impl Connections {
-    fn find_addressant(&self, address: SocketAddr) -> Option<SyncConnection> {
-        self.0.get(&address).cloned()
+struct ConnSocket(Socket, SocketAddr);
+
+impl ConnSocket {
+    async fn send(&self, packet: Packet) -> Result<()> {
+        self.0.send_to(packet, self.1).await
+    }
+}
+
+struct Header {
+    source: SocketAddr,
+    dest: SocketAddr,
+}
+
+impl Header {
+    fn from_udp(socket: &Socket, address: SocketAddr) -> Result<Self> {
+        Ok(Self {
+            source: socket.0.local_addr()?,
+            dest: address,
+        })
     }
 
-    fn create_connection(&mut self, address: SocketAddr, ack: u32) -> SyncConnection {
-        let conn = Arc::new(Mutex::new(Connection { _ack: ack }));
-        self.0.insert(address, Arc::clone(&conn));
-        conn
+    fn syn_ack(&self, seq: Seq, ack: Ack) -> Packet {
+        Packet::from(PseudoPacket {
+            source: self.source,
+            dest: self.dest,
+            seq,
+            extra: PacketExtra {
+                ack,
+                flags: Flags::default().flip_syn().flip_ack(),
+                ..Default::default()
+            },
+        })
     }
 
-    fn remove_connection(&mut self, address: SocketAddr) {
-        self.0.remove(&address);
+    fn ack(&self, seq: Seq, ack: Ack) -> Packet {
+        Packet::from(PseudoPacket {
+            source: self.source,
+            dest: self.dest,
+            seq,
+            extra: PacketExtra {
+                ack,
+                flags: Flags::default().flip_ack(),
+                ..Default::default()
+            },
+        })
+    }
+
+    fn fin_ack(&self, seq: Seq, ack: Ack) -> Packet {
+        Packet::from(PseudoPacket {
+            source: self.source,
+            dest: self.dest,
+            seq,
+            extra: PacketExtra {
+                ack,
+                flags: Flags::default().flip_fin().flip_ack(),
+                ..Default::default()
+            },
+        })
     }
 }
