@@ -10,18 +10,8 @@ services:
     command: sh /share/client-wrapper.sh server 8080 5
     volumes:
       - ${PWD}/share:/share:ro
-  test_delay:
+  test:
     image: gaiaadm/pumba
-    command: -i 20s netem -d 10s delay udptcp_server_1 udptcp_client_1
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-  test_loss:
-    image: gaiaadm/pumba
-    command: -i 30s netem -d 20s loss udptcp_server_1 udptcp_client_1
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-  test_corrupt:
-    image: gaiaadm/pumba
-    command: -i 40s netem -d 30s corrupt udptcp_server_1 udptcp_client_1
+    command: -i 20s netem -d 10s ${PUMBA_MODE} udptcp_server_1 udptcp_client_1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
